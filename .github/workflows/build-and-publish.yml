@@ -1,4 +1,4 @@
-name: Build and publish DL
+name: Build and publish DLL
 
 on:
   push:
@@ -49,57 +49,57 @@ jobs:
 
       - name: Publish to fatwar-bin
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-        shell: bash
+        shell: pwsh
         env:
           BIN_REPO_TOKEN: ${{ secrets.BIN_REPO_TOKEN }}
           BIN_REPO: san5ezez/fatwar-bin
         run: |
-          set -e
-          if [ -z "$BIN_REPO_TOKEN" ]; then
-            echo "BIN_REPO_TOKEN not set — skip publish"
+          if (-not $env:BIN_REPO_TOKEN) {
+            Write-Host "BIN_REPO_TOKEN not set — skip publish"
             exit 0
-          fi
-          AUTH="Authorization: Bearer ${BIN_REPO_TOKEN}"
-          API="https://api.github.com/repos/${BIN_REPO}"
+          }
 
-          # release "latest"
-          curl -sS -X POST -H "$AUTH" -H "Accept: application/vnd.github+json" \
-            "$API/releases" \
-            -d '{"tag_name":"latest","name":"Latest","body":"Rolling build","draft":false}' \
-            > /tmp/rel.json || true
+          $headers = @{
+            Authorization = "Bearer $env:BIN_REPO_TOKEN"
+            Accept        = "application/vnd.github+json"
+            "User-Agent"  = "FatWar-CI"
+          }
+          $api = "https://api.github.com/repos/$env:BIN_REPO"
 
-          if ! grep -q '"id"' /tmp/rel.json 2>/dev/null; then
-            curl -sS -H "$AUTH" -H "Accept: application/vnd.github+json" \
-              "$API/releases/tags/latest" > /tmp/rel.json
-          fi
+          $rel = $null
+          try {
+            $rel = Invoke-RestMethod -Headers $headers -Uri "$api/releases/tags/latest"
+          } catch {
+            $body = @{
+              tag_name = "latest"
+              name     = "Latest"
+              body     = "Rolling build"
+              draft    = $false
+            } | ConvertTo-Json
+            $rel = Invoke-RestMethod -Method Post -Headers $headers -Uri "$api/releases" -Body $body -ContentType "application/json"
+          }
 
-          REL_ID=$(python -c "import json;print(json.load(open('/tmp/rel.json'))['id'])")
-          UPLOAD=$(python -c "import json;print(json.load(open('/tmp/rel.json'))['upload_url'].split('{')[0])")
+          $relId = $rel.id
+          $uploadBase = ($rel.upload_url -split "\{")[0]
 
-          # delete old FatWar.dll asset if exists
-          curl -sS -H "$AUTH" -H "Accept: application/vnd.github+json" \
-            "\( API/releases/ \){REL_ID}/assets" > /tmp/assets.json
-          python - <<'PY'
-import json, os, urllib.request
-token = os.environ["BIN_REPO_TOKEN"]
-repo = os.environ["BIN_REPO"]
-for a in json.load(open("/tmp/assets.json")):
-    if a.get("name") == "FatWar.dll":
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases/assets/{a['id']}",
-            method="DELETE",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        )
-        try:
-            urllib.request.urlopen(req)
-        except Exception as e:
-            print(e)
-PY
+          try {
+            $assets = Invoke-RestMethod -Headers $headers -Uri "$api/releases/$relId/assets"
+            foreach ($a in $assets) {
+              if ($a.name -eq "FatWar.dll") {
+                Invoke-RestMethod -Method Delete -Headers $headers -Uri "https://api.github.com/repos/\( env:BIN_REPO/releases/assets/ \)($a.id)" -ErrorAction SilentlyContinue
+              }
+            }
+          } catch {
+            Write-Host "asset cleanup: $_"
+          }
 
-          curl -sS -X POST -H "$AUTH" \
-            -H "Content-Type: application/octet-stream" \
-            -H "Accept: application/vnd.github+json" \
-            "${UPLOAD}?name=FatWar.dll" \
-            --data-binary @out/FatWar.dll
-
-          echo "OK → https://github.com/san5ezez/fatwar-bin/releases/latest"
+          $bytes = [System.IO.File]::ReadAllBytes("$pwd/out/FatWar.dll")
+          $uploadHeaders = @{
+            Authorization  = "Bearer $env:BIN_REPO_TOKEN"
+            Accept         = "application/vnd.github+json"
+            "Content-Type" = "application/octet-stream"
+            "User-Agent"   = "FatWar-CI"
+          }
+          $uploadUrl = $uploadBase + "?name=FatWar.dll"
+          Invoke-RestMethod -Method Post -Headers $uploadHeaders -Uri $uploadUrl -Body $bytes | Out-Null
+          Write-Host "OK -> https://github.com/san5ezez/fatwar-bin/releases/latest"
