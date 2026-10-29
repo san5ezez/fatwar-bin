@@ -1,0 +1,105 @@
+name: Build and publish DLL
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build FatWar.dll
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: "2022"
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl -DCMAKE_C_COMPILER=cl
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Pack DLL
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $dll = Get-ChildItem -Path build -Recurse -Filter *.dll |
+            Where-Object { $_.Name -match 'FatWar|celerity|cs2_internal' } |
+            Select-Object -First 1
+          if (-not $dll) { throw "DLL not found under build/" }
+          Copy-Item $dll.FullName out/FatWar.dll -Force
+          Get-Item out/FatWar.dll | Format-List Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FatWar-dll
+          path: out/FatWar.dll
+
+      - name: Publish to fatwar-bin
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        shell: bash
+        env:
+          BIN_REPO_TOKEN: ${{ secrets.BIN_REPO_TOKEN }}
+          BIN_REPO: san5ezez/fatwar-bin
+        run: |
+          set -e
+          if [ -z "$BIN_REPO_TOKEN" ]; then
+            echo "BIN_REPO_TOKEN not set — skip publish"
+            exit 0
+          fi
+          AUTH="Authorization: Bearer ${BIN_REPO_TOKEN}"
+          API="https://api.github.com/repos/${BIN_REPO}"
+
+          # release "latest"
+          curl -sS -X POST -H "$AUTH" -H "Accept: application/vnd.github+json" \
+            "$API/releases" \
+            -d '{"tag_name":"latest","name":"Latest","body":"Rolling build","draft":false}' \
+            > /tmp/rel.json || true
+
+          if ! grep -q '"id"' /tmp/rel.json 2>/dev/null; then
+            curl -sS -H "$AUTH" -H "Accept: application/vnd.github+json" \
+              "$API/releases/tags/latest" > /tmp/rel.json
+          fi
+
+          REL_ID=$(python -c "import json;print(json.load(open('/tmp/rel.json'))['id'])")
+          UPLOAD=$(python -c "import json;print(json.load(open('/tmp/rel.json'))['upload_url'].split('{')[0])")
+
+          # delete old FatWar.dll asset if exists
+          curl -sS -H "$AUTH" -H "Accept: application/vnd.github+json" \
+            "\( API/releases/ \){REL_ID}/assets" > /tmp/assets.json
+          python - <<'PY'
+import json, os, urllib.request
+token = os.environ["BIN_REPO_TOKEN"]
+repo = os.environ["BIN_REPO"]
+for a in json.load(open("/tmp/assets.json")):
+    if a.get("name") == "FatWar.dll":
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases/assets/{a['id']}",
+            method="DELETE",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        try:
+            urllib.request.urlopen(req)
+        except Exception as e:
+            print(e)
+PY
+
+          curl -sS -X POST -H "$AUTH" \
+            -H "Content-Type: application/octet-stream" \
+            -H "Accept: application/vnd.github+json" \
+            "${UPLOAD}?name=FatWar.dll" \
+            --data-binary @out/FatWar.dll
+
+          echo "OK → https://github.com/san5ezez/fatwar-bin/releases/latest"
